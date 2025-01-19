@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "lore"
+version = "0.1.0"
+description = "Service for generating NLP responses to software development beginner questions"
+authors = ["Steve Brownlee <chortlehoort@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+torch = "2.2.1"
+transformers = "^4.48.0"
+valkey = "^6.0.2"
+tqdm = "^4.67.1"
+numpy = "^2.2.2"
+tenacity = "^9.0.0"
+pydantic = "^2.10.5"
+prometheus-client = "^0.21.1"
+structlog = "^25.1.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
