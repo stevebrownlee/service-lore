@@ -3,13 +3,14 @@
 import threading
 import json
 import time
+from typing import Optional
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import structlog
 from prometheus_client import start_http_server
 from valkey import Valkey
 
 from config import Settings
-from models import ChunkAck, Question, Response, Error
+from models import ChunkAck, Question, Error, MessageType
 from metrics import Metrics
 from buffer import ChunkBuffer
 
@@ -17,7 +18,7 @@ from buffer import ChunkBuffer
 class LoreService:
     """Service for processing student questions with AI-generated explanations"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         # Load configuration
         self.settings = Settings()
 
@@ -33,27 +34,48 @@ class LoreService:
         self.buffer_lock = threading.Lock()
 
         # Initialize Valkey client
-        self.valkey = Valkey(
-            host=self.settings.VALKEY_HOST,
-            port=self.settings.VALKEY_PORT,
-            db=self.settings.VALKEY_DB,
-        )
+        self._init_valkey()
 
         # Initialize model
-        self.log.info("initializing_model", model=self.settings.MODEL_NAME)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.settings.MODEL_NAME, device_map=self.settings.DEVICE
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(self.settings.MODEL_NAME)
+        self._init_model()
 
-        # System prompt
-        self.SYSTEM_PROMPT = """You are a programming concept explainer.
-        You must ONLY provide natural language explanations.
-        Never generate or include code examples.
-        Never use code formatting, backticks, or code blocks.
-        Explain concepts using analogies and plain language instead.
-        The explanations must be generated to be understandable by a beginner.
-        The explanations must assume the user has no prior knowledge of the concept."""
+    def _init_valkey(self) -> None:
+        """Initialize Valkey client with error handling"""
+        try:
+            self.log.info("connecting_to_valkey", host=self.settings.VALKEY_HOST)
+            self.valkey = Valkey(
+                host=self.settings.VALKEY_HOST,
+                port=self.settings.VALKEY_PORT,
+                db=self.settings.VALKEY_DB,
+            )
+        except Exception as e:
+            self.log.error("valkey_initialization_failed", error=str(e))
+            raise
+
+    def _init_model(self) -> None:
+        """Initialize AI model with error handling"""
+        try:
+            self.log.info("initializing_model", model=self.settings.MODEL_NAME)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.settings.MODEL_NAME,
+                device_map=self.settings.DEVICE
+            )
+            self.tokenizer = AutoTokenizer.from_pretrained(self.settings.MODEL_NAME)
+        except Exception as e:
+            self.log.error("model_initialization_failed", error=str(e))
+            raise
+
+    def _clean_stale_buffers(self, max_age: float = 300.0) -> None:
+        """Remove buffers that haven't been updated in the specified time"""
+        current_time = time.time()
+        with self.buffer_lock:
+            stale_buffers = [
+                request_id for request_id, buffer in self.active_buffers.items()
+                if (current_time - buffer.last_update) > max_age
+            ]
+            for request_id in stale_buffers:
+                self.log.warning("removing_stale_buffer", request_id=request_id)
+                del self.active_buffers[request_id]
 
     def generate_response(self, question: Question) -> None:
         """Generate and buffer response chunks with metrics and logging"""
@@ -67,7 +89,7 @@ class LoreService:
         try:
             # Time the model inference
             with self.metrics.model_inference_time.time():
-                full_prompt = f"{self.SYSTEM_PROMPT}\n\nQuestion: {question.question}"
+                full_prompt = f"{self.settings.SYSTEM_PROMPT}\n\nQuestion: {question.question}"
                 inputs = self.tokenizer(
                     full_prompt,
                     return_tensors="pt",
@@ -109,13 +131,9 @@ class LoreService:
             completion_time = time.time() - start_time
 
             # Update all metrics
-            self.metrics.questions_processed.labels(
-                cohort_id=str(question.cohort_id or 'none')
-            ).inc()
+            self.metrics.questions_processed.inc()
             self.metrics.response_time.observe(completion_time)
-            self.metrics.token_usage.labels(
-                cohort_id=str(question.cohort_id or 'none')
-            ).inc(total_tokens)
+            self.metrics.token_usage.inc(total_tokens)
 
             self.log.info("response_generated",
                     request_id=question.request_id,
@@ -123,141 +141,122 @@ class LoreService:
                     token_count=total_tokens)
 
         except Exception as e:
-            self.metrics.errors_total.labels(
-                error_type=type(e).__name__
-            ).inc()
+            error = self._handle_error(e, question.request_id)
+            self._send_error_chunk(error, buffer)
 
-            error = Error(
-                request_id=question.request_id,
-                error_type=type(e).__name__,
-                error_message=str(e),
-            )
-            self.log.error("error_generating_response",
-                        error=error.model_dump())
+        finally:
+            self._cleanup_buffer(question.request_id)
 
-            # Try to send error message to client
+    def _handle_error(self, e: Exception, request_id: Optional[int]) -> Error:
+        """Standardized error handling"""
+        error = Error(
+            request_id=request_id,
+            error_type=type(e).__name__,
+            error_message=str(e),
+        )
+        self.metrics.errors_total.labels(error_type=error.error_type).inc()
+        self.log.error("error_occurred", error=error.model_dump())
+        return error
+
+    def _send_error_chunk(self, error: Error, buffer: ChunkBuffer) -> None:
+        """Send error message to client through buffer"""
+        if error.request_id:
             error_chunk = buffer.add_chunk(
-                f"Error generating response: {str(e)}",
+                f"Error: {error.error_message}",
                 is_final=True
             )
             if error_chunk:
                 self.valkey.publish(
-                    f'{self.settings.RESPONSE_CHANNEL_PREFIX}{question.request_id}',
+                    f'{self.settings.RESPONSE_CHANNEL_PREFIX}{error.request_id}',
                     error_chunk.model_dump_json()
                 )
 
-        finally:
-            # Clean up buffer if it's empty
-            with self.buffer_lock:
-                if question.request_id in self.active_buffers:
-                    if not self.active_buffers[question.request_id].buffer:
-                        del self.active_buffers[question.request_id]
+    def _cleanup_buffer(self, request_id: int) -> None:
+        """Clean up buffer if empty"""
+        with self.buffer_lock:
+            if request_id in self.active_buffers:
+                if not self.active_buffers[request_id].buffer:
+                    del self.active_buffers[request_id]
+
     def handle_message(self, message: dict) -> None:
         """Process incoming message from Valkey"""
-        start_time = time.time()
-        data = None
-
         try:
-            # Parse and validate payload
             data = json.loads(message["data"])
-            question = Question(**data)
+            message_type = data.get("type", MessageType.QUESTION)
 
+            if message_type == MessageType.QUESTION:
+                self._handle_question_message(data)
+            elif message_type == MessageType.ACK:
+                self._handle_ack_message(data)
+            else:
+                self.log.warning("unknown_message_type", type=message_type)
+
+        except json.JSONDecodeError as e:
+            self._handle_error(e, None)
+        except Exception as e:
+            self._handle_error(e, None)
+
+    def _handle_question_message(self, data: dict) -> None:
+        """Handle incoming question message"""
+        try:
+            question = Question(**data)
             self.log.info(
                 "received_question",
                 request_id=question.request_id,
                 user_id=question.user_id,
-                cohort_id=question.cohort_id,
             )
-
-            # Update queue metrics
             self.metrics.queue_length.inc()
-
-            # Generate response
-            response = self.generate_response(question)
-
-            # Publish response
-            self.valkey.publish(
-                f"{self.settings.RESPONSE_CHANNEL_PREFIX}{question.request_id}",
-                response.model_dump_json(),
-            )
-
-            # Update metrics
-            self.metrics.questions_processed.labels(
-                cohort_id=str(question.cohort_id or "none")
-            ).inc()
-            self.metrics.response_time.observe(response.completion_time)
-
-            self.log.info(
-                "response_generated",
-                request_id=question.request_id,
-                completion_time=response.completion_time,
-                token_count=response.token_count,
-            )
-
-        except Exception as e:
-            self.metrics.errors_total.labels(error_type=type(e).__name__).inc()
-
-            error = Error(
-                request_id=data.get("request_id") if data else None,
-                error_type=type(e).__name__,
-                error_message=str(e),
-            )
-            self.log.error("error_processing_question", error=error.model_dump())
+            self.generate_response(question)
         finally:
             self.metrics.queue_length.dec()
 
-    def handle_ack(self, message: dict) -> None:
-        """Handle acknowledgment messages from clients"""
+    def _handle_ack_message(self, data: dict) -> None:
+        """Handle acknowledgment message"""
         try:
-            ack = ChunkAck(**json.loads(message["data"]))
-
+            ack = ChunkAck(**data)
             with self.buffer_lock:
                 if ack.request_id in self.active_buffers:
                     buffer = self.active_buffers[ack.request_id]
                     next_chunk = buffer.ack_received(ack.sequence_number)
 
                     if next_chunk:
-                        # Send next chunk
                         self.valkey.publish(
                             f"{self.settings.RESPONSE_CHANNEL_PREFIX}{ack.request_id}",
                             next_chunk.model_dump_json(),
                         )
-
-                    # Clean up completed buffers
-                    if not buffer.buffer and buffer.is_complete:
-                        del self.active_buffers[ack.request_id]
         except Exception as e:
-            self.log.error("error_processing_ack", error=str(e))
+            self._handle_error(e, data.get("request_id"))
 
     def start(self) -> None:
         """Start the service"""
-        # Start Prometheus metrics server
-        start_http_server(self.settings.PROMETHEUS_PORT)
-        self.log.info("metrics_server_started", port=self.settings.PROMETHEUS_PORT)
-
-        # Subscribe to questions channel
-        pubsub = self.valkey.pubsub()
-        pubsub.subscribe(self.settings.QUESTION_CHANNEL)
-
-        self.log.info(
-            "service_started",
-            channel=self.settings.QUESTION_CHANNEL,
-            valkey_host=self.settings.VALKEY_HOST,
-        )
-
-        # Listen for messages
         try:
+            # Start Prometheus metrics server
+            start_http_server(self.settings.PROMETHEUS_PORT)
+            self.log.info("metrics_server_started", port=self.settings.PROMETHEUS_PORT)
+
+            # Subscribe to channels
+            pubsub = self.valkey.pubsub()
+            pubsub.subscribe([
+                self.settings.QUESTION_CHANNEL,
+                self.settings.ACK_CHANNEL
+            ])
+
+            self.log.info(
+                "service_started",
+                channels=[self.settings.QUESTION_CHANNEL, self.settings.ACK_CHANNEL],
+                valkey_host=self.settings.VALKEY_HOST,
+            )
+
+            # Main message loop
             for message in pubsub.listen():
                 if message["type"] == "message":
                     self.handle_message(message)
+                    self._clean_stale_buffers()
+
         except Exception as e:
-            error = Error(
-                error_type=type(e).__name__,
-                error_message=str(e),
-            )
+            error = self._handle_error(e, None)
             self.log.error("service_error", error=error.model_dump())
             raise
-
 
 def main() -> None:
     """Main entry point for the service"""

@@ -35,20 +35,48 @@ Lore utilizes the Mistral language model, a state-of-the-art Large Language Mode
 
 ```mermaid
 sequenceDiagram
-    participant Student
+    participant Client
     participant API
-    participant Valkey
+    participant Valkey as Valkey Message Bus
     participant Lore
+    participant Buffer
 
-    Student->>API: POST /question
-    API->>Valkey: Publish student_question
-    Note right of API: Channel: student_question
-    Valkey->>Lore: Forward question
-    Note right of Lore: Process with Mistral
-    Lore->>Valkey: Publish answer
-    Valkey->>API: Forward response
-    API->>Student: Return answer
+    Client->>+API: POST /helprequest {question}
+    API->>API: Create HelpRequest record
+    API->>Valkey: Publish to 'student_question'
+    API-->>-Client: Return requestId
 
+    Client->>+API: GET /answers/{requestId} (SSE)
+    API->>API: Initialize EventSource stream
+
+    Valkey->>+Lore: Receive question
+    Note over Lore: Begin model inference
+
+    loop Until response complete
+        Lore->>Buffer: Add generated text chunk
+        alt Buffer at window size
+            Buffer-->>Lore: Wait for acks
+        else Buffer has space
+            Lore->>Valkey: Publish chunk to 'lore_response_{requestId}'
+            Valkey->>API: Deliver chunk
+            API->>Client: Stream chunk via SSE
+
+            Client->>+API: POST /answers/{requestId}/ack
+            API->>Valkey: Publish to 'lore_ack'
+            Valkey->>Lore: Deliver ack
+            Lore->>Buffer: Remove acknowledged chunk
+            Note over Buffer: Space freed for next chunk
+            API-->>-Client: Ack confirmed
+        end
+    end
+
+    Lore->>Valkey: Publish final chunk (is_final=true)
+    Valkey->>API: Deliver final chunk
+    API->>Client: Stream final chunk
+    Client->>API: Final acknowledgment
+    Client->>Client: Close EventSource
+
+    Note over Client,Lore: Stream complete
 ```
 
 ## Configuration
