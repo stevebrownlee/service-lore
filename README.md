@@ -7,7 +7,8 @@ Lore is an AI-powered learning assistant service that uses the Mistral language 
 
 ## Dependencies and Virtual Environment
 
-[Install Poetry](https://python-poetry.org/) for creating/managing virtual environment.
+1. [Install Poetry](https://python-poetry.org/) for creating/managing virtual environment.
+2. Run `poetry self add poetry-plugin-dotenv@latest` to have Poetry support sourcing the `.env` file you need.
 
 Then install dependencies and create the shell.
 
@@ -15,12 +16,6 @@ Then install dependencies and create the shell.
 poetry install
 poetry shell
 ```
-
-Required packages:
-- poetry
-- mistralai
-- valkey
-- pydantic
 
 ## Mistral Model Overview
 
@@ -80,12 +75,11 @@ sequenceDiagram
 ```
 
 ## Configuration
-Create a `.env` file with the following variables:
-```
-MISTRAL_API_KEY=your_api_key
-VALKEY_URL=your_valkey_url
-REDIS_URL=your_redis_url
-```
+Create a `.env` file with the following variables, for you to test locally:
 
-## Usage
-The service listens for questions on the Valkey `student_question` channel and responds with natural language explanations. All responses are filtered to prevent code generation.
+```
+HUGGING_FACE_HUB_TOKEN=<<token>>
+VALKEY_HOST=localhost
+VALKEY_PORT=6379
+VALKEY_PASSWORD=<<password>>
+```
