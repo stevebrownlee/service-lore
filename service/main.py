@@ -56,11 +56,13 @@ class LoreService:
         """Initialize AI model with error handling"""
         try:
             self.log.info("initializing_model", model=self.settings.MODEL_NAME)
+
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.settings.MODEL_NAME,
                 device_map=self.settings.DEVICE
             )
             self.tokenizer = AutoTokenizer.from_pretrained(self.settings.MODEL_NAME)
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         except Exception as e:
             self.log.error("model_initialization_failed", error=str(e))
             raise
@@ -90,6 +92,8 @@ class LoreService:
             # Time the model inference
             with self.metrics.model_inference_time.time():
                 full_prompt = f"{self.settings.SYSTEM_PROMPT}\n\nQuestion: {question.question}"
+
+                self.log.info("configuring_model", request_id=question.request_id)
                 inputs = self.tokenizer(
                     full_prompt,
                     return_tensors="pt",
@@ -97,28 +101,49 @@ class LoreService:
                     truncation=True
                 )
 
+                attention_mask = inputs["input_ids"].ne(self.tokenizer.pad_token_id)
+
                 # Stream tokens
-                for token in self.model.generate(
+                self.log.info("generating_tokens", request_id=question.request_id)
+
+                # Inside generate_response method
+                tokens = self.model.generate(
                     inputs["input_ids"],
-                    max_length=self.settings.MODEL_MAX_LENGTH,
-                    temperature=self.settings.MODEL_TEMPERATURE,
-                    num_return_sequences=1,
-                    streaming=True
-                ):
-                    chunk = self.tokenizer.decode(token, skip_special_tokens=True)
+                    do_sample=True,
+                    temperature=0.7,
+                    max_new_tokens=100,
+                    attention_mask=attention_mask,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    min_length=30,  # Force minimum generation length
+                    repetition_penalty=1.2,  # Reduce repetitive text
+                    no_repeat_ngram_size=2
+                )
+
+                # Get full response minus the prompt
+                prompt_length = len(inputs["input_ids"][0])
+                generated_tokens = tokens[0][prompt_length:]
+                self.log.info("decoding_token", request_id=question.request_id)
+                response = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+
+
+                self.log.info("generating_chunks", request_id=question.request_id)
+                chunks = [response[i:i+50] for i in range(0, len(response), 50)]
+
+                for chunk in chunks:
                     total_tokens += 1
-
+                    self.log.info("adding_chunk", request_id=question.request_id)
                     chunk_obj = buffer.add_chunk(chunk)
-
-                    if chunk_obj:
-                        self.valkey.publish(
-                            f'{self.settings.RESPONSE_CHANNEL_PREFIX}{question.request_id}',
-                            chunk_obj.model_dump_json()
-                        )
 
                     # If buffer is full, wait for acks
                     while len(buffer.buffer) >= buffer.window_size:
                         time.sleep(0.2)
+
+                    if chunk_obj:
+                        self.log.info("publishing_chunk", request_id=question.request_id)
+                        self.valkey.publish(
+                            f'{self.settings.RESPONSE_CHANNEL_PREFIX}{question.request_id}',
+                            chunk_obj.model_dump_json()
+                        )
 
             # Mark final chunk and send completion metrics
             final_chunk = buffer.add_chunk("", is_final=True)
@@ -247,11 +272,19 @@ class LoreService:
                 valkey_host=self.settings.VALKEY_HOST,
             )
 
-            # Main message loop
-            for message in pubsub.listen():
-                if message["type"] == "message":
-                    self.handle_message(message)
-                    self._clean_stale_buffers()
+            try:
+                # Main message loop
+                for message in pubsub.listen():
+                    if message["type"] == "message":
+                        self.handle_message(message)
+                        self._clean_stale_buffers()
+
+            except KeyboardInterrupt:
+                self.log.info("Shutting down gracefully...")
+            except Exception as e:
+                self.log.error("Fatal error", error=str(e))
+                raise
+
 
         except Exception as e:
             error = self._handle_error(e, None)
@@ -276,3 +309,10 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# /Users/chortlehoort/Library/Caches/pypoetry/virtualenvs/lore-r_e3AbgO-py3.10/lib/python3.10/site-packages/transformers/generation/configuration_utils.py:628: UserWarning: `do_sample` is set to `False`. However, `temperature` is set to `0.7` -- this flag is only used in sample-based generation modes. You should set `do_sample=True` or unset `temperature`.
+#   warnings.warn(
+# The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+# Setting `pad_token_id` to `eos_token_id`:2 for open-end generation.
+# The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+# Both `max_new_tokens` (=20) and `max_length`(=500) seem to have been set. `max_new_tokens` will take precedence. Please refer to the documentation for more information. (https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)

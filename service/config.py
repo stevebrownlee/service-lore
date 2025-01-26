@@ -24,7 +24,7 @@ class Settings(BaseModel):
         description="Name of the HuggingFace model to use"
     )
     MODEL_MAX_LENGTH: int = Field(
-        default=int(os.getenv("MODEL_MAX_LENGTH", "500")),
+        default=int(os.getenv("MODEL_MAX_LENGTH", "50")),
         description="Maximum length of generated responses"
     )
     MODEL_TEMPERATURE: float = Field(
