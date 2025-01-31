@@ -32,6 +32,7 @@ class LoreService:
         # Set up buffer for managing unacknowledged text chunks
         self.active_buffers: dict[int, ChunkBuffer] = {}
         self.buffer_lock = threading.Lock()
+        self.buffer_condition = threading.Condition(self.buffer_lock)
 
         # Initialize Valkey client
         self._init_valkey()
@@ -70,7 +71,7 @@ class LoreService:
     def _clean_stale_buffers(self, max_age: float = 300.0) -> None:
         """Remove buffers that haven't been updated in the specified time"""
         current_time = time.time()
-        with self.buffer_lock:
+        with self.buffer_condition:
             stale_buffers = [
                 request_id for request_id, buffer in self.active_buffers.items()
                 if (current_time - buffer.last_update) > max_age
@@ -79,13 +80,17 @@ class LoreService:
                 self.log.warning("removing_stale_buffer", request_id=request_id)
                 del self.active_buffers[request_id]
 
+            # Notify waiting threads that buffer state has changed
+            if stale_buffers:
+                self.buffer_condition.notify_all()
+
     def generate_response(self, question: Question) -> None:
         """Generate and buffer response chunks with metrics and logging"""
         start_time = time.time()
         total_tokens = 0
-        buffer = ChunkBuffer(question.request_id)
+        buffer = ChunkBuffer(question.request_id, self.buffer_condition)  # Pass condition here
 
-        with self.buffer_lock:
+        with self.buffer_condition:
             self.active_buffers[question.request_id] = buffer
 
         try:
@@ -134,16 +139,21 @@ class LoreService:
                     self.log.info("adding_chunk", request_id=question.request_id)
                     chunk_obj = buffer.add_chunk(chunk)
 
-                    # If buffer is full, wait for acks
-                    while len(buffer.buffer) >= buffer.window_size:
-                        time.sleep(0.2)
-
+                    # Move the buffer check outside of condition to prevent deadlock
                     if chunk_obj:
                         self.log.info("publishing_chunk", request_id=question.request_id)
                         self.valkey.publish(
                             f'{self.settings.RESPONSE_CHANNEL_PREFIX}{question.request_id}',
                             chunk_obj.model_dump_json()
                         )
+
+                        # Wait for acknowledgment after publishing
+                        with self.buffer_condition:
+                            while len(buffer.buffer) >= buffer.window_size:
+                                self.log.debug("waiting_for_ack",
+                                    request_id=question.request_id,
+                                    buffer_size=len(buffer.buffer))
+                                self.buffer_condition.wait(timeout=1.0)  # Add timeout to prevent indefinite wait
 
             # Mark final chunk and send completion metrics
             final_chunk = buffer.add_chunk("", is_final=True)
@@ -239,16 +249,22 @@ class LoreService:
         """Handle acknowledgment message"""
         try:
             ack = ChunkAck(**data)
-            with self.buffer_lock:
+            self.log.info("received_ack", request_id=ack.request_id, sequence_number=data['sequence_number'])
+
+            with self.buffer_condition:
                 if ack.request_id in self.active_buffers:
                     buffer = self.active_buffers[ack.request_id]
                     next_chunk = buffer.ack_received(ack.sequence_number)
+
+                    # Notify waiting threads before publishing next chunk
+                    self.buffer_condition.notify_all()
 
                     if next_chunk:
                         self.valkey.publish(
                             f"{self.settings.RESPONSE_CHANNEL_PREFIX}{ack.request_id}",
                             next_chunk.model_dump_json(),
                         )
+
         except Exception as e:
             self._handle_error(e, data.get("request_id"))
 
@@ -261,10 +277,20 @@ class LoreService:
 
             # Subscribe to channels
             pubsub = self.valkey.pubsub()
-            pubsub.subscribe([
-                self.settings.QUESTION_CHANNEL,
-                self.settings.ACK_CHANNEL
-            ])
+            # pubsub.subscribe(self.settings.QUESTION_CHANNEL)
+            # pubsub.subscribe(self.settings.ACK_CHANNEL)
+            pubsub.subscribe(self.settings.QUESTION_CHANNEL, self.settings.ACK_CHANNEL)
+
+            while True:
+                message = pubsub.get_message()
+                if not message:
+                    break
+                self.log.info("subscription_confirmation", message=message)
+                if message['type'] == 'subscribe':
+                    self.log.info("subscribed_to_channel",
+                        channel=message['channel'].decode(),
+                        total_subscriptions=message['data']
+                    )
 
             self.log.info(
                 "service_started",
@@ -274,17 +300,31 @@ class LoreService:
 
             try:
                 # Main message loop
-                for message in pubsub.listen():
-                    if message["type"] == "message":
+                message_count = 0
+                last_clean = time.time()
+
+                while True:
+                    # Get message with short timeout
+                    message = pubsub.get_message(timeout=0.01)  # Shorter timeout for more frequent checks
+
+                    if message and message["type"] == "message":
+                        self.log.debug("received_message", message=message)
                         self.handle_message(message)
-                        self._clean_stale_buffers()
+                        message_count += 1
+
+                    # Clean stale buffers every 100 messages or every 5 seconds
+                    current_time = time.time()
+                    if message_count >= 100 or (current_time - last_clean) >= 5.0:
+                        if self.active_buffers:
+                            self._clean_stale_buffers()
+                        message_count = 0
+                        last_clean = current_time
 
             except KeyboardInterrupt:
                 self.log.info("Shutting down gracefully...")
             except Exception as e:
                 self.log.error("Fatal error", error=str(e))
                 raise
-
 
         except Exception as e:
             error = self._handle_error(e, None)
