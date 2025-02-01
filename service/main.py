@@ -3,11 +3,14 @@
 import threading
 import json
 import time
+import queue  # Add this import
 from typing import Optional
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import structlog
 from prometheus_client import start_http_server
 from valkey import Valkey
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 
 from config import Settings
 from models import ChunkAck, Question, Error, MessageType
@@ -39,6 +42,21 @@ class LoreService:
 
         # Initialize model
         self._init_model()
+
+        self.response_queue = queue.Queue()
+
+        # Replace individual threads with thread pool
+        self.executor = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="lore"
+        )
+        self.futures = []
+
+        self.retransmit_interval = 1.0
+        self.retransmit_thread = threading.Thread(
+            target=self._check_retransmissions,
+            daemon=True
+        )
 
     def _init_valkey(self) -> None:
         """Initialize Valkey client with error handling"""
@@ -88,7 +106,7 @@ class LoreService:
         """Generate and buffer response chunks with metrics and logging"""
         start_time = time.time()
         total_tokens = 0
-        buffer = ChunkBuffer(question.request_id, self.buffer_condition)  # Pass condition here
+        buffer = ChunkBuffer(question.request_id)  # Pass condition here
 
         with self.buffer_condition:
             self.active_buffers[question.request_id] = buffer
@@ -249,7 +267,9 @@ class LoreService:
         """Handle acknowledgment message"""
         try:
             ack = ChunkAck(**data)
-            self.log.info("received_ack", request_id=ack.request_id, sequence_number=data['sequence_number'])
+            self.log.info("received_ack",
+                request_id=ack.request_id,
+                sequence_number=ack.sequence_number)
 
             with self.buffer_condition:
                 if ack.request_id in self.active_buffers:
@@ -260,13 +280,74 @@ class LoreService:
                     self.buffer_condition.notify_all()
 
                     if next_chunk:
+                        self.log.debug("sending_next_chunk",
+                            request_id=ack.request_id,
+                            sequence_number=next_chunk.sequence_number)
                         self.valkey.publish(
                             f"{self.settings.RESPONSE_CHANNEL_PREFIX}{ack.request_id}",
-                            next_chunk.model_dump_json(),
+                            next_chunk.model_dump_json()
                         )
 
         except Exception as e:
             self._handle_error(e, data.get("request_id"))
+
+    def _check_retransmissions(self) -> None:
+        """Periodically check for chunks that need retransmission"""
+        while True:
+            time.sleep(self.retransmit_interval)
+            for buffer in self.active_buffers.values():
+                chunks = buffer.check_retransmissions()
+                for chunk in chunks:
+                    self.log.info("retransmitting_chunk",
+                        request_id=chunk.request_id,
+                        sequence_number=chunk.sequence_number)
+                    self.valkey.publish(
+                        f'{self.settings.RESPONSE_CHANNEL_PREFIX}{chunk.request_id}',
+                        chunk.model_dump_json()
+                    )
+
+    def _process_responses(self) -> None:
+        """Process responses in worker thread"""
+        while True:
+            try:
+                question = self.response_queue.get()
+                self.generate_response(question)
+            except Exception as e:
+                self.log.error("response_generation_error", error=str(e))
+            finally:
+                self.response_queue.task_done()
+
+    def _process_questions(self) -> None:
+        """Dedicated thread for handling questions and response generation"""
+        pubsub = self.valkey.pubsub()
+        self.log.info("subscribing_to_channel", channel=self.settings.QUESTION_CHANNEL)
+        pubsub.subscribe(self.settings.QUESTION_CHANNEL)
+
+        while True:
+            message = pubsub.get_message(timeout=0.1)
+            if message and message["type"] == "message":
+                self.log.debug("received_message", message=message, channel=self.settings.QUESTION_CHANNEL)
+                try:
+                    data = json.loads(message["data"])
+                    self._handle_question_message(data)
+                except Exception as e:
+                    self.log.error("question_processing_error", error=str(e))
+
+    def _process_acks(self) -> None:
+        """Dedicated thread for handling ACK messages"""
+        pubsub = self.valkey.pubsub()
+        self.log.info("subscribing_to_channel", channel=self.settings.ACK_CHANNEL)
+        pubsub.subscribe(self.settings.ACK_CHANNEL)
+
+        while True:
+            message = pubsub.get_message(timeout=0.1)
+            if message and message["type"] == "message":
+                self.log.debug("received_message", message=message, channel=self.settings.ACK_CHANNEL)
+                try:
+                    data = json.loads(message["data"])
+                    self._handle_ack_message(data)
+                except Exception as e:
+                    self.log.error("ack_processing_error", error=str(e))
 
     def start(self) -> None:
         """Start the service"""
@@ -275,60 +356,21 @@ class LoreService:
             start_http_server(self.settings.PROMETHEUS_PORT)
             self.log.info("metrics_server_started", port=self.settings.PROMETHEUS_PORT)
 
-            # Subscribe to channels
-            pubsub = self.valkey.pubsub()
-            # pubsub.subscribe(self.settings.QUESTION_CHANNEL)
-            # pubsub.subscribe(self.settings.ACK_CHANNEL)
-            pubsub.subscribe(self.settings.QUESTION_CHANNEL, self.settings.ACK_CHANNEL)
+            # Submit long-running tasks to thread pool
+            self.log.info("starting_question_processing_thread")
+            self.futures.append(self.executor.submit(self._process_questions))
+            self.log.info("starting_ack_processing_thread")
+            self.futures.append(self.executor.submit(self._process_acks))
 
-            while True:
-                message = pubsub.get_message()
-                if not message:
-                    break
-                self.log.info("subscription_confirmation", message=message)
-                if message['type'] == 'subscribe':
-                    self.log.info("subscribed_to_channel",
-                        channel=message['channel'].decode(),
-                        total_subscriptions=message['data']
-                    )
+            # Wait for completion (or KeyboardInterrupt)
+            concurrent.futures.wait(self.futures, return_when=concurrent.futures.FIRST_EXCEPTION)
 
-            self.log.info(
-                "service_started",
-                channels=[self.settings.QUESTION_CHANNEL, self.settings.ACK_CHANNEL],
-                valkey_host=self.settings.VALKEY_HOST,
-            )
-
-            try:
-                # Main message loop
-                message_count = 0
-                last_clean = time.time()
-
-                while True:
-                    # Get message with short timeout
-                    message = pubsub.get_message(timeout=0.01)  # Shorter timeout for more frequent checks
-
-                    if message and message["type"] == "message":
-                        self.log.debug("received_message", message=message)
-                        self.handle_message(message)
-                        message_count += 1
-
-                    # Clean stale buffers every 100 messages or every 5 seconds
-                    current_time = time.time()
-                    if message_count >= 100 or (current_time - last_clean) >= 5.0:
-                        if self.active_buffers:
-                            self._clean_stale_buffers()
-                        message_count = 0
-                        last_clean = current_time
-
-            except KeyboardInterrupt:
-                self.log.info("Shutting down gracefully...")
-            except Exception as e:
-                self.log.error("Fatal error", error=str(e))
-                raise
-
+        except KeyboardInterrupt:
+            self.log.info("Shutting down gracefully...")
+            self.executor.shutdown(wait=True)
         except Exception as e:
-            error = self._handle_error(e, None)
-            self.log.error("service_error", error=error.model_dump())
+            self.log.error("Fatal error", error=str(e))
+            self.executor.shutdown(wait=False)
             raise
 
 def main() -> None:
@@ -349,10 +391,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-# /Users/chortlehoort/Library/Caches/pypoetry/virtualenvs/lore-r_e3AbgO-py3.10/lib/python3.10/site-packages/transformers/generation/configuration_utils.py:628: UserWarning: `do_sample` is set to `False`. However, `temperature` is set to `0.7` -- this flag is only used in sample-based generation modes. You should set `do_sample=True` or unset `temperature`.
-#   warnings.warn(
-# The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
-# Setting `pad_token_id` to `eos_token_id`:2 for open-end generation.
-# The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
-# Both `max_new_tokens` (=20) and `max_length`(=500) seem to have been set. `max_new_tokens` will take precedence. Please refer to the documentation for more information. (https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)
