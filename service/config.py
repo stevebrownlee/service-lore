@@ -20,12 +20,16 @@ class Settings(BaseModel):
 
     # Model configuration
     MODEL_NAME: str = Field(
-        default=os.getenv("MODEL_NAME", "mistralai/Mistral-7B-Instruct-v0.1"),
+        default=os.getenv("MODEL_NAME", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"),
         description="Name of the HuggingFace model to use"
     )
     MODEL_MAX_LENGTH: int = Field(
-        default=int(os.getenv("MODEL_MAX_LENGTH", "50")),
+        default=int(os.getenv("MODEL_MAX_LENGTH", "512")),
         description="Maximum length of generated responses"
+    )
+    MODEL_MIN_LENGTH: int = Field(
+        default=int(os.getenv("MODEL_MIN_LENGTH", "50")),
+        description="Minimum length of generated responses"
     )
     MODEL_TEMPERATURE: float = Field(
         default=float(os.getenv("MODEL_TEMPERATURE", "0.7")),
@@ -34,7 +38,7 @@ class Settings(BaseModel):
 
     # Metrics configuration
     PROMETHEUS_PORT: int = Field(
-        default=int(os.getenv("PROMETHEUS_PORT", "8000")),
+        default=int(os.getenv("PROMETHEUS_PORT", "8901")),
         description="Port for Prometheus metrics server"
     )
 
@@ -84,13 +88,25 @@ class Settings(BaseModel):
 
     # System prompt
     SYSTEM_PROMPT: str = Field(
-        default="""You are a programming concept explainer.
-        You must ONLY provide natural language explanations.
-        Never generate or include code examples.
-        Never use code formatting, backticks, or code blocks.
-        Explain concepts using analogies and plain language instead.
-        The explanations must be generated to be understandable by a beginner.
-        The explanations must assume the user has no prior knowledge of the concept.""",
+        default= """You are a programming concept explainer.
+        You must:
+        1. Provide natural language explanations only
+        2. Focus specifically on answering the given question
+        3. Use clear examples from everyday life
+        4. Break down complex ideas into simple parts
+        5. Explain as if talking to someone with no programming experience
+
+        Never:
+        1. Include code examples
+        2. Use technical jargon without explanation
+        3. Make assumptions about prior knowledge
+        4. Use code formatting or symbols
+
+        Each explanation should:
+        1. Start with a simple definition
+        2. Use relevant real-world analogies
+        3. Build understanding step by step
+        4. Connect to familiar concepts""",
         description="System prompt for the model"
     )
 

@@ -3,14 +3,13 @@
 import threading
 import json
 import time
-import queue  # Add this import
+import queue
 from typing import Optional
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import structlog
+import torch
 from prometheus_client import start_http_server
 from valkey import Valkey
-import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor
 
 from config import Settings
 from models import ChunkAck, Question, Error, MessageType
@@ -45,18 +44,27 @@ class LoreService:
 
         self.response_queue = queue.Queue()
 
-        # Replace individual threads with thread pool
-        self.executor = ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="lore"
-        )
-        self.futures = []
-
         self.retransmit_interval = 1.0
-        self.retransmit_thread = threading.Thread(
-            target=self._check_retransmissions,
+
+        # Create dedicated threads for message handling
+        self.question_thread = threading.Thread(
+            target=self._process_questions,
+            name="question_processor",
             daemon=True
         )
+        self.ack_thread = threading.Thread(
+            target=self._process_acks,
+            name="ack_processor",
+            daemon=True
+        )
+        self.retransmit_thread = threading.Thread(
+            target=self._check_retransmissions,
+            name="retransmission_checker",
+            daemon=True
+        )
+
+        # Track thread health
+        self.running = threading.Event()
 
     def _init_valkey(self) -> None:
         """Initialize Valkey client with error handling"""
@@ -78,10 +86,12 @@ class LoreService:
 
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.settings.MODEL_NAME,
-                device_map=self.settings.DEVICE
-            )
+                torch_dtype=torch.float16,
+                device_map="cpu"
+            ).to(self.settings.DEVICE)
+
             self.tokenizer = AutoTokenizer.from_pretrained(self.settings.MODEL_NAME)
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+
         except Exception as e:
             self.log.error("model_initialization_failed", error=str(e))
             raise
@@ -106,7 +116,7 @@ class LoreService:
         """Generate and buffer response chunks with metrics and logging"""
         start_time = time.time()
         total_tokens = 0
-        buffer = ChunkBuffer(question.request_id)  # Pass condition here
+        buffer = ChunkBuffer(question.request_id)
 
         with self.buffer_condition:
             self.active_buffers[question.request_id] = buffer
@@ -114,64 +124,68 @@ class LoreService:
         try:
             # Time the model inference
             with self.metrics.model_inference_time.time():
-                full_prompt = f"{self.settings.SYSTEM_PROMPT}\n\nQuestion: {question.question}"
+                messages = [
+                    { "role": "system", "content": self.settings.SYSTEM_PROMPT, },
+                    {"role": "user", "content": question.question},
+                ]
+                prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                inputs = self.tokenizer(prompt, return_tensors="pt")
 
-                self.log.info("configuring_model", request_id=question.request_id)
-                inputs = self.tokenizer(
-                    full_prompt,
-                    return_tensors="pt",
-                    max_length=self.settings.MODEL_MAX_LENGTH,
-                    truncation=True
-                )
+                # Initialize generated sequence with input
+                generated = inputs["input_ids"]
+                past_key_values = None
 
-                attention_mask = inputs["input_ids"].ne(self.tokenizer.pad_token_id)
-
-                # Stream tokens
-                self.log.info("generating_tokens", request_id=question.request_id)
-
-                # Inside generate_response method
-                tokens = self.model.generate(
-                    inputs["input_ids"],
-                    do_sample=True,
-                    temperature=0.7,
-                    max_new_tokens=100,
-                    attention_mask=attention_mask,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    min_length=30,  # Force minimum generation length
-                    repetition_penalty=1.2,  # Reduce repetitive text
-                    no_repeat_ngram_size=2
-                )
-
-                # Get full response minus the prompt
-                prompt_length = len(inputs["input_ids"][0])
-                generated_tokens = tokens[0][prompt_length:]
-                self.log.info("decoding_token", request_id=question.request_id)
-                response = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-
-
-                self.log.info("generating_chunks", request_id=question.request_id)
-                chunks = [response[i:i+50] for i in range(0, len(response), 50)]
-
-                for chunk in chunks:
-                    total_tokens += 1
-                    self.log.info("adding_chunk", request_id=question.request_id)
-                    chunk_obj = buffer.add_chunk(chunk)
-
-                    # Move the buffer check outside of condition to prevent deadlock
-                    if chunk_obj:
-                        self.log.info("publishing_chunk", request_id=question.request_id)
-                        self.valkey.publish(
-                            f'{self.settings.RESPONSE_CHANNEL_PREFIX}{question.request_id}',
-                            chunk_obj.model_dump_json()
+                # Generate token by token
+                for _ in range(self.settings.MODEL_MAX_LENGTH):  # max_new_tokens
+                    with torch.no_grad():
+                        outputs = self.model(
+                            input_ids=generated[:, -1:],  # only last token for input
+                            past_key_values=past_key_values,
+                            use_cache=True,
                         )
 
-                        # Wait for acknowledgment after publishing
-                        with self.buffer_condition:
-                            while len(buffer.buffer) >= buffer.window_size:
-                                self.log.debug("waiting_for_ack",
-                                    request_id=question.request_id,
-                                    buffer_size=len(buffer.buffer))
-                                self.buffer_condition.wait(timeout=1.0)  # Add timeout to prevent indefinite wait
+                    # Get next token logits
+                    next_token_logits = outputs.logits[:, -1, :]
+
+                    # Sample next token
+                    probs = torch.softmax(next_token_logits / 0.7, dim=-1)  # temperature=0.7
+                    next_token = torch.multinomial(probs, num_samples=1)
+
+                    # Append to generated sequence
+                    generated = torch.cat([generated, next_token], dim=-1)
+
+                    # Update past key values for efficiency
+                    past_key_values = outputs.past_key_values
+
+                    # Decode and print just the new token
+                    new_text = self.tokenizer.decode(next_token[0], skip_special_tokens=True)
+
+
+
+                    if new_text:  # Only print if there's actual text (skip special tokens)
+                        self.log.info("generating_chunks", request_id=question.request_id)
+                        chunks = [new_text[i:i+50] for i in range(0, len(new_text), 50)]
+
+                        for chunk in chunks:
+                            total_tokens += 1
+                            self.log.info("adding_chunk", request_id=question.request_id)
+                            chunk_obj = buffer.add_chunk(chunk)
+
+                            # Move the buffer check outside of condition to prevent deadlock
+                            if chunk_obj:
+                                self.log.info("publishing_chunk", request_id=question.request_id)
+                                self.valkey.publish(
+                                    f'{self.settings.RESPONSE_CHANNEL_PREFIX}{question.request_id}',
+                                    chunk_obj.model_dump_json()
+                                )
+
+                                # Wait for acknowledgment after publishing
+                                with self.buffer_condition:
+                                    while len(buffer.buffer) >= buffer.window_size:
+                                        self.log.debug("waiting_for_ack",
+                                            request_id=question.request_id,
+                                            buffer_size=len(buffer.buffer))
+                                        self.buffer_condition.wait(timeout=1.0)  # Add timeout to prevent indefinite wait
 
             # Mark final chunk and send completion metrics
             final_chunk = buffer.add_chunk("", is_final=True)
@@ -318,36 +332,32 @@ class LoreService:
                 self.response_queue.task_done()
 
     def _process_questions(self) -> None:
-        """Dedicated thread for handling questions and response generation"""
+        """Handle incoming questions in dedicated thread"""
         pubsub = self.valkey.pubsub()
-        self.log.info("subscribing_to_channel", channel=self.settings.QUESTION_CHANNEL)
         pubsub.subscribe(self.settings.QUESTION_CHANNEL)
 
-        while True:
-            message = pubsub.get_message(timeout=0.1)
-            if message and message["type"] == "message":
-                self.log.debug("received_message", message=message, channel=self.settings.QUESTION_CHANNEL)
-                try:
+        while self.running.is_set():
+            try:
+                message = pubsub.get_message(timeout=0.1)
+                if message and message["type"] == "message":
                     data = json.loads(message["data"])
                     self._handle_question_message(data)
-                except Exception as e:
-                    self.log.error("question_processing_error", error=str(e))
+            except Exception as e:
+                self.log.error("question_processing_error", error=str(e))
 
     def _process_acks(self) -> None:
-        """Dedicated thread for handling ACK messages"""
+        """Handle ACK messages in dedicated thread"""
         pubsub = self.valkey.pubsub()
-        self.log.info("subscribing_to_channel", channel=self.settings.ACK_CHANNEL)
         pubsub.subscribe(self.settings.ACK_CHANNEL)
 
-        while True:
-            message = pubsub.get_message(timeout=0.1)
-            if message and message["type"] == "message":
-                self.log.debug("received_message", message=message, channel=self.settings.ACK_CHANNEL)
-                try:
+        while self.running.is_set():
+            try:
+                message = pubsub.get_message(timeout=0.1)
+                if message and message["type"] == "message":
                     data = json.loads(message["data"])
                     self._handle_ack_message(data)
-                except Exception as e:
-                    self.log.error("ack_processing_error", error=str(e))
+            except Exception as e:
+                self.log.error("ack_processing_error", error=str(e))
 
     def start(self) -> None:
         """Start the service"""
@@ -356,21 +366,34 @@ class LoreService:
             start_http_server(self.settings.PROMETHEUS_PORT)
             self.log.info("metrics_server_started", port=self.settings.PROMETHEUS_PORT)
 
-            # Submit long-running tasks to thread pool
-            self.log.info("starting_question_processing_thread")
-            self.futures.append(self.executor.submit(self._process_questions))
-            self.log.info("starting_ack_processing_thread")
-            self.futures.append(self.executor.submit(self._process_acks))
+            # Set running flag and start threads
+            self.running.set()
+            self.question_thread.start()
+            self.ack_thread.start()
+            self.retransmit_thread.start()
 
-            # Wait for completion (or KeyboardInterrupt)
-            concurrent.futures.wait(self.futures, return_when=concurrent.futures.FIRST_EXCEPTION)
+            self.log.info("service_started",
+                question_thread=self.question_thread.name,
+                ack_thread=self.ack_thread.name
+            )
+
+            # Keep main thread alive
+            while True:
+                time.sleep(1)
+                if not (self.question_thread.is_alive() and
+                       self.ack_thread.is_alive() and
+                       self.retransmit_thread.is_alive()):
+                    raise RuntimeError("A worker thread has died")
 
         except KeyboardInterrupt:
             self.log.info("Shutting down gracefully...")
-            self.executor.shutdown(wait=True)
+            self.running.clear()  # Signal threads to stop
+            self.question_thread.join(timeout=5.0)
+            self.ack_thread.join(timeout=5.0)
+            self.retransmit_thread.join(timeout=5.0)
         except Exception as e:
             self.log.error("Fatal error", error=str(e))
-            self.executor.shutdown(wait=False)
+            self.running.clear()
             raise
 
 def main() -> None:
