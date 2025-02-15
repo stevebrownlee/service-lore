@@ -1,0 +1,130 @@
+{
+    "annotations": {
+      "list": []
+    },
+    "editable": true,
+    "graphTooltip": 0,
+    "links": [],
+    "panels": [
+      {
+        "title": "Question Processing",
+        "type": "row",
+        "panels": [
+          {
+            "title": "Questions Processed",
+            "type": "stat",
+            "datasource": "Prometheus",
+            "targets": [
+              {
+                "expr": "questions_processed_total"
+              }
+            ]
+          },
+          {
+            "title": "Current Queue Length",
+            "type": "gauge",
+            "datasource": "Prometheus",
+            "targets": [
+              {
+                "expr": "question_queue_length"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "title": "Response Generation",
+        "type": "row",
+        "panels": [
+          {
+            "title": "Response Generation Time",
+            "type": "graph",
+            "datasource": "Prometheus",
+            "targets": [
+              {
+                "expr": "rate(response_generation_seconds_sum[5m]) / rate(response_generation_seconds_count[5m])"
+              }
+            ]
+          },
+          {
+            "title": "Model Inference Time",
+            "type": "graph",
+            "datasource": "Prometheus",
+            "targets": [
+              {
+                "expr": "rate(model_inference_seconds_sum[5m]) / rate(model_inference_seconds_count[5m])"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "title": "Buffer Management",
+        "type": "row",
+        "panels": [
+          {
+            "title": "Active Buffers",
+            "type": "gauge",
+            "datasource": "Prometheus",
+            "targets": [
+              {
+                "expr": "active_buffers_total"
+              }
+            ]
+          },
+          {
+            "title": "Chunks Statistics",
+            "type": "graph",
+            "datasource": "Prometheus",
+            "targets": [
+              {
+                "expr": "chunks_sent_total",
+                "legend": "Sent"
+              },
+              {
+                "expr": "chunks_acknowledged_total",
+                "legend": "Acknowledged"
+              },
+              {
+                "expr": "chunk_retry_total",
+                "legend": "Retried"
+              }
+            ]
+          },
+          {
+            "title": "Buffer Wait Time",
+            "type": "heatmap",
+            "datasource": "Prometheus",
+            "targets": [
+              {
+                "expr": "rate(buffer_wait_seconds_bucket[5m])"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "title": "Token Usage",
+        "type": "row",
+        "panels": [
+          {
+            "title": "Total Tokens Used",
+            "type": "stat",
+            "datasource": "Prometheus",
+            "targets": [
+              {
+                "expr": "token_usage_total"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "refresh": "5s",
+    "schemaVersion": 27,
+    "style": "dark",
+    "timezone": "browser",
+    "title": "Lore Service Dashboard",
+    "uid": "lore-service",
+    "version": 1
+  }
