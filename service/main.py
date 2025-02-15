@@ -5,7 +5,7 @@ import json
 import time
 import queue
 from typing import Optional
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 import structlog
 import torch
 from prometheus_client import start_http_server
@@ -100,12 +100,17 @@ class LoreService:
         """Remove buffers that haven't been updated in the specified time"""
         current_time = time.time()
         with self.buffer_condition:
-            stale_buffers = [
-                request_id for request_id, buffer in self.active_buffers.items()
-                if (current_time - buffer.last_update) > max_age
-            ]
+            stale_buffers = []
+            for request_id, buffer in self.active_buffers.items():
+                # Check both buffer age and if all chunks are expired
+                if ((current_time - buffer.last_update) > max_age or
+                    (not buffer.buffer and current_time - buffer.created_at > buffer.max_chunk_age)):
+                    stale_buffers.append(request_id)
+
             for request_id in stale_buffers:
-                self.log.warning("removing_stale_buffer", request_id=request_id)
+                self.log.warning("removing_stale_buffer",
+                               request_id=request_id,
+                               age=current_time - self.active_buffers[request_id].last_update)
                 del self.active_buffers[request_id]
 
             # Notify waiting threads that buffer state has changed
@@ -122,90 +127,123 @@ class LoreService:
             self.active_buffers[question.request_id] = buffer
 
         try:
-            # Time the model inference
             with self.metrics.model_inference_time.time():
+                # TinyLlama uses ChatML format
                 messages = [
-                    { "role": "system", "content": self.settings.SYSTEM_PROMPT, },
-                    {"role": "user", "content": question.question},
+                    {
+                        "role": "system",
+                        "content": self.settings.SYSTEM_PROMPT
+                    },
+                    {
+                        "role": "user",
+                        "content": f"{question.question}"
+                    }
                 ]
-                prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                inputs = self.tokenizer(prompt, return_tensors="pt")
 
-                # Initialize generated sequence with input
-                generated = inputs["input_ids"]
-                past_key_values = None
+                # Use chat template
+                self.log.info("defining_prompt", messages=messages)
+                prompt = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
 
-                # Generate token by token
-                for _ in range(self.settings.MODEL_MAX_LENGTH):  # max_new_tokens
-                    with torch.no_grad():
-                        outputs = self.model(
-                            input_ids=generated[:, -1:],  # only last token for input
-                            past_key_values=past_key_values,
-                            use_cache=True,
-                        )
+                # Prepare inputs
+                self.log.info("generating_inputs", request_id=question.request_id)
+                inputs = self.tokenizer(
+                    prompt,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.settings.MODEL_MAX_LENGTH
+                ).to(self.settings.DEVICE)
 
-                    # Get next token logits
-                    next_token_logits = outputs.logits[:, -1, :]
+                # Configure streamer for TinyLlama
+                self.log.info("configuring_streamer", request_id=question.request_id)
+                streamer = TextIteratorStreamer(
+                    self.tokenizer,
+                    timeout=None,
+                    skip_prompt=True,
+                    skip_special_tokens=True
+                )
 
-                    # Sample next token
-                    probs = torch.softmax(next_token_logits / 0.7, dim=-1)  # temperature=0.7
-                    next_token = torch.multinomial(probs, num_samples=1)
+                # TinyLlama specific generation parameters
+                self.log.info("starting_generation", request_id=question.request_id)
+                thread = threading.Thread(
+                    target=self.model.generate,
+                    kwargs={
+                        "input_ids": inputs["input_ids"],
+                        "streamer": streamer,
+                        "max_new_tokens": self.settings.MODEL_MAX_LENGTH,
+                        "do_sample": True,
+                        "temperature": 0.7,
+                        "top_p": 0.9,
+                        "top_k": 50,
+                        "repetition_penalty": 1.2,
+                        "no_repeat_ngram_size": 3
+                    }
+                )
+                thread.start()
 
-                    # Append to generated sequence
-                    generated = torch.cat([generated, next_token], dim=-1)
+                # Process generated chunks
+                current_chunk = ""
+                for new_text in streamer:
+                    if new_text:
+                        current_chunk += new_text
+                        total_tokens += len(self.tokenizer(new_text)["input_ids"])
 
-                    # Update past key values for efficiency
-                    past_key_values = outputs.past_key_values
+                        # Buffer chunks when they reach defined size
+                        if len(current_chunk) >= self.settings.BUFFER_CHUNK_SIZE:
+                            self.log.info("adding_chunk",
+                                request_id=question.request_id,
+                                chunk_size=len(current_chunk)
+                            )
+                            chunk_obj = buffer.add_chunk(current_chunk)
+                            current_chunk = ""
 
-                    # Decode and print just the new token
-                    new_text = self.tokenizer.decode(next_token[0], skip_special_tokens=True)
-
-
-
-                    if new_text:  # Only print if there's actual text (skip special tokens)
-                        self.log.info("generating_chunks", request_id=question.request_id)
-                        chunks = [new_text[i:i+50] for i in range(0, len(new_text), 50)]
-
-                        for chunk in chunks:
-                            total_tokens += 1
-                            self.log.info("adding_chunk", request_id=question.request_id)
-                            chunk_obj = buffer.add_chunk(chunk)
-
-                            # Move the buffer check outside of condition to prevent deadlock
                             if chunk_obj:
-                                self.log.info("publishing_chunk", request_id=question.request_id)
+                                self.log.info("publishing_chunk",
+                                    request_id=question.request_id)
                                 self.valkey.publish(
                                     f'{self.settings.RESPONSE_CHANNEL_PREFIX}{question.request_id}',
                                     chunk_obj.model_dump_json()
                                 )
 
-                                # Wait for acknowledgment after publishing
                                 with self.buffer_condition:
                                     while len(buffer.buffer) >= buffer.window_size:
                                         self.log.debug("waiting_for_ack",
                                             request_id=question.request_id,
                                             buffer_size=len(buffer.buffer))
-                                        self.buffer_condition.wait(timeout=1.0)  # Add timeout to prevent indefinite wait
+                                        self.buffer_condition.wait(timeout=1.0)
 
-            # Mark final chunk and send completion metrics
-            final_chunk = buffer.add_chunk("", is_final=True)
-            if final_chunk:
-                self.valkey.publish(
-                    f'{self.settings.RESPONSE_CHANNEL_PREFIX}{question.request_id}',
-                    final_chunk.model_dump_json()
-                )
+                # Handle any remaining text
+                if current_chunk:
+                    chunk_obj = buffer.add_chunk(current_chunk)
+                    if chunk_obj:
+                        self.valkey.publish(
+                            f'{self.settings.RESPONSE_CHANNEL_PREFIX}{question.request_id}',
+                            chunk_obj.model_dump_json()
+                        )
 
-            completion_time = time.time() - start_time
+                # Mark final chunk and send completion metrics
+                final_chunk = buffer.add_chunk("", is_final=True)
+                if final_chunk:
+                    self.valkey.publish(
+                        f'{self.settings.RESPONSE_CHANNEL_PREFIX}{question.request_id}',
+                        final_chunk.model_dump_json()
+                    )
 
-            # Update all metrics
-            self.metrics.questions_processed.inc()
-            self.metrics.response_time.observe(completion_time)
-            self.metrics.token_usage.inc(total_tokens)
+                completion_time = time.time() - start_time
 
-            self.log.info("response_generated",
-                    request_id=question.request_id,
-                    completion_time=completion_time,
-                    token_count=total_tokens)
+                # Update all metrics
+                self.metrics.questions_processed.inc()
+                self.metrics.response_time.observe(completion_time)
+                self.metrics.token_usage.inc(total_tokens)
+
+                self.log.info("response_generated",
+                        request_id=question.request_id,
+                        completion_time=completion_time,
+                        token_count=total_tokens)
 
         except Exception as e:
             error = self._handle_error(e, question.request_id)

@@ -73,6 +73,10 @@ class Settings(BaseModel):
         default=int(os.getenv("BUFFER_WINDOW_SIZE", "5")),
         description="Maximum number of unacknowledged chunks in buffer"
     )
+    BUFFER_CHUNK_SIZE: int = Field(
+        default=int(os.getenv("BUFFER_CHUNK_SIZE", "50")),
+        description="Size of individual chunks added to buffer"
+    )
 
     # Log configuration
     LOG_LEVEL: str = Field(
@@ -93,14 +97,11 @@ class Settings(BaseModel):
         1. Provide natural language explanations only
         2. Focus specifically on answering the given question
         3. Use clear examples from everyday life
-        4. Break down complex ideas into simple parts
-        5. Explain as if talking to someone with no programming experience
-
-        Never:
-        1. Include code examples
-        2. Use technical jargon without explanation
-        3. Make assumptions about prior knowledge
-        4. Use code formatting or symbols
+        4. Avoid explanations that involve math, or dates, or regular expressions
+        5. Break down complex ideas into simple parts
+        6. Explain as if talking to someone with no programming experience
+        7. Use simple language and avoid complex words
+        8. If the question is not related to programming, generate a response that explains that you will only answer questions about programming
 
         Each explanation should:
         1. Start with a simple definition

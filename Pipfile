@@ -17,6 +17,7 @@ bitsandbytes = "*"
 sentencepiece = "*"
 protobuf = "*"
 numpy = "==2.2.2"
+grafana-client = "*"
 
 [dev-packages]
 

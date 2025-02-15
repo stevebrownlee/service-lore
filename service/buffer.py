@@ -16,7 +16,10 @@ class ChunkBuffer:
         self.last_acked: int = -1
         self.unacked_chunks: dict[int, TextChunk] = {}  # Store unacknowledged chunks
         self.retransmit_timeout: float = 1.0  # Seconds
-        self.last_transmit: dict[int, float] = {}  # Track transmission times
+        self.max_chunk_age: float = 30.0
+        self.last_transmit: dict[int, float] = {}
+        self.last_update = time.time()
+
         self.condition = threading.Condition()
         self.log = structlog.get_logger()
         self.settings = Settings()
@@ -33,7 +36,8 @@ class ChunkBuffer:
                     request_id=self.request_id,
                     sequence_number=self.next_sequence,
                     chunk=chunk,
-                    is_final=is_final
+                    is_final=is_final,
+                    created_at=time.time(),
                 )
                 self.buffer[self.next_sequence] = chunk_obj
                 self.unacked_chunks[self.next_sequence] = chunk_obj
@@ -44,6 +48,9 @@ class ChunkBuffer:
             return None
 
     def ack_received(self, sequence_number: int) -> Optional[TextChunk]:
+        """Process acknowledgment and return next chunk if available"""
+        self._update_timestamp()
+
         """Handle cumulative acknowledgments like TCP"""
         with self.condition:
             # Remove all chunks up to and including this sequence number
@@ -77,6 +84,26 @@ class ChunkBuffer:
         """Check for chunks that need retransmission"""
         current_time = time.time()
         retransmit = []
+
+        expired_sequences = [seq for seq, chunk in self.buffer.items()
+                        if (current_time - chunk.created_at) >= self.max_chunk_age]
+
+        if expired_sequences:
+            # Remove expired chunks from buffer
+            for seq in expired_sequences:
+                chunk = self.buffer.pop(seq)
+                if seq in self.unacked_chunks:
+                    del self.unacked_chunks[seq]
+                if seq in self.last_transmit:
+                    del self.last_transmit[seq]
+
+                # Log expired chunks
+                self.log.info(
+                    "chunk_expired",
+                    request_id=self.request_id,
+                    sequence_number=chunk.sequence_number,
+                    age=current_time - chunk.created_at
+                )
 
         with self.condition:
             for seq, transmit_time in self.last_transmit.items():

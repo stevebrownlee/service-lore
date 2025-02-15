@@ -3,6 +3,7 @@ from typing import Optional
 from pydantic import BaseModel, Field
 from datetime import datetime
 from enum import Enum
+import time
 
 
 class MessageType(str, Enum):
@@ -17,15 +18,16 @@ class TextChunk(BaseModel):
     sequence_number: int = Field(..., description="Monotonically increasing sequence number")
     chunk: str = Field(..., description="The text chunk")
     is_final: bool = Field(False, description="Whether this is the last chunk")
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
     retries: int = Field(default=0, description="Number of times this chunk has been retried")
+    created_at: float = Field(default_factory=time.time)
+    timestamp: float = Field(default_factory=time.time)
 
 
 class ChunkAck(BaseModel):
     """Acknowledgment of a received chunk"""
     request_id: int = Field(..., description="ID of the original request")
     sequence_number: int = Field(..., description="Sequence number being acknowledged")
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=datetime.now)
     type: MessageType = Field(default=MessageType.ACK, description="Message type identifier")
 
 
@@ -34,7 +36,7 @@ class Question(BaseModel):
     request_id: int = Field(..., description="Unique identifier for the help request")
     question: str = Field(..., min_length=1, description="The question being asked")
     user_id: int = Field(..., description="ID of the student asking the question")
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=datetime.now)
     type: MessageType = Field(default=MessageType.QUESTION, description="Message type identifier")
 
 
@@ -44,7 +46,7 @@ class Response(BaseModel):
     response: str = Field(..., description="Generated explanation")
     completion_time: float = Field(..., description="Time taken to generate response in seconds")
     token_count: int = Field(..., description="Number of tokens in response")
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=datetime.now)
 
 
 class ServiceMetrics(BaseModel):
@@ -66,7 +68,7 @@ class Error(BaseModel):
     request_id: Optional[int] = Field(None, description="Request ID if available")
     error_type: str = Field(..., description="Type of error encountered")
     error_message: str = Field(..., description="Error description")
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=datetime.now)
     stack_trace: Optional[str] = Field(None, description="Stack trace if available")
     component: Optional[str] = Field(None, description="Component where error occurred")
     severity: str = Field(default="ERROR", description="Error severity level")
@@ -76,6 +78,15 @@ class BufferState(BaseModel):
     request_id: int = Field(..., description="ID of the request")
     chunks_sent: int = Field(default=0, description="Number of chunks sent")
     chunks_acked: int = Field(default=0, description="Number of chunks acknowledged")
-    last_update: datetime = Field(default_factory=datetime.utcnow)
+    last_update: datetime = Field(default_factory=datetime.now)
     is_complete: bool = Field(default=False, description="Whether all chunks have been sent")
     window_size: int = Field(..., description="Current window size")
+
+class Chunk(BaseModel):
+    """Model for a chunk of generated text"""
+    request_id: int
+    sequence_number: int
+    text: str
+    is_final: bool = False
+    timestamp: float  # Last transmission time
+    created_at: float  # When the chunk was first created
