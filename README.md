@@ -7,19 +7,49 @@ Lore is an AI-powered learning assistant service that uses the Mistral language 
 
 ## Dependencies and Virtual Environment
 
-1. [Install Poetry](https://python-poetry.org/) for creating/managing virtual environment.
-2. Run `poetry self add poetry-plugin-dotenv@latest` to have Poetry support sourcing the `.env` file you need.
+[Install Pipenv](https://pipenv.pypa.io/en/latest/installation.html) for creating/managing virtual environment.
 
 Then install dependencies and create the shell.
 
 ```bash
-poetry install
-poetry shell
+pipenv install
+pipenv shell
 ```
 
-## Mistral Model Overview
+## Getting Started
 
-Lore utilizes the Mistral language model, a state-of-the-art Large Language Model (LLM) specifically fine-tuned for educational contexts. Key features:
+### Configuration
+
+Create a `.env` file with the following variables, for you to test locally:
+
+```env
+HUGGING_FACE_HUB_TOKEN=token
+VALKEY_HOST=localhost
+VALKEY_PORT=6379
+VALKEY_PASSWORD=password
+MODEL_NAME=TinyLlama/TinyLlama-1.1B-Chat-v1.0
+LOG_LEVEL=DEBUG
+```
+
+### Running the Service
+
+Run the Lore service with the following command.
+
+```bash
+pipenv run python service/main.py
+```
+
+Then start the monitoring services with the following command.
+
+```bash
+docker compose -f monitoring/docker-compose.yml up -d
+```
+
+## Model Overview
+
+In development, Lore uses the TinyLlama model. This is because it is faster to run locally, and the quality is still good enough for development purposes.
+
+Lore utilizes the Mistral language model in production, a state-of-the-art Large Language Model (LLM) specifically fine-tuned for educational contexts. Key features:
 
 - Optimized for natural language explanations
 - Built-in safeguards against code generation
@@ -30,56 +60,55 @@ Lore utilizes the Mistral language model, a state-of-the-art Large Language Mode
 
 ```mermaid
 sequenceDiagram
-    participant Client
-    participant API
-    participant Valkey as Valkey Message Bus
-    participant Lore
-    participant Buffer
+    participant Student
+    participant React Client
+    participant Django API
+    participant Postgres
+    participant Valkey
+    participant Lore Question Thread
+    participant Lore AI Thread
+    participant Lore Ack Thread
+    participant Lore Retransmit Thread
 
-    Client->>+API: POST /helprequest {question}
-    API->>API: Create HelpRequest record
-    API->>Valkey: Publish to 'student_question'
-    API-->>-Client: Return requestId
+    Note over Lore Question Thread,Lore Retransmit Thread: All threads running continuously
 
-    Client->>+API: GET /answers/{requestId} (SSE)
-    API->>API: Initialize EventSource stream
+    Student->>React Client: Enters question
+    React Client->>Django API: POST /questions
+    Django API->>Postgres: Store question
+    Django API->>Valkey: Publish question
 
-    Valkey->>+Lore: Receive question
-    Note over Lore: Begin model inference
+    Valkey->>Lore Question Thread: Receive question
 
-    loop Until response complete
-        Lore->>Buffer: Add generated text chunk
-        alt Buffer at window size
-            Buffer-->>Lore: Wait for acks
-        else Buffer has space
-            Lore->>Valkey: Publish chunk to 'lore_response_{requestId}'
-            Valkey->>API: Deliver chunk
-            API->>Client: Stream chunk via SSE
+    activate Lore AI Thread
+    Lore Question Thread->>Lore AI Thread: Generate response
 
-            Client->>+API: POST /answers/{requestId}/ack
-            API->>Valkey: Publish to 'lore_ack'
-            Valkey->>Lore: Deliver ack
-            Lore->>Buffer: Remove acknowledged chunk
-            Note over Buffer: Space freed for next chunk
-            API-->>-Client: Ack confirmed
+    par Process chunks
+        loop For each chunk
+            Lore AI Thread->>Valkey: Publish chunk
+            Valkey->>Django API: Receive chunk
+            Django API->>React Client: Stream chunk via SSE
+            React Client->>Student: Display chunk
+            React Client->>Django API: POST /ack
+            Django API->>Valkey: Publish ack
+            Valkey->>Lore Ack Thread: Receive ack
+            Lore Ack Thread->>Lore AI Thread: Update buffer
+        end
+    and Check for missing chunks
+        loop Every 1s
+            Lore Retransmit Thread->>Lore AI Thread: Check buffers
+            opt Chunk needs retransmission
+                Lore AI Thread->>Valkey: Republish chunk
+            end
         end
     end
 
-    Lore->>Valkey: Publish final chunk (is_final=true)
-    Valkey->>API: Deliver final chunk
-    API->>Client: Stream final chunk
-    Client->>API: Final acknowledgment
-    Client->>Client: Close EventSource
-
-    Note over Client,Lore: Stream complete
+    Lore AI Thread->>Valkey: Publish final chunk
+    deactivate Lore AI Thread
+    Valkey->>Django API: Receive final chunk
+    Django API->>React Client: Stream final chunk
+    React Client->>Student: Display complete response
+    React Client->>Django API: POST final /ack
+    Django API->>Valkey: Publish final ack
+    Valkey->>Lore Ack Thread: Receive final ack
 ```
 
-## Configuration
-Create a `.env` file with the following variables, for you to test locally:
-
-```
-HUGGING_FACE_HUB_TOKEN=<<token>>
-VALKEY_HOST=localhost
-VALKEY_PORT=6379
-VALKEY_PASSWORD=<<password>>
-```
