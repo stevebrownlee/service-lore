@@ -73,7 +73,7 @@ sequenceDiagram
     Note over Lore Question Thread,Lore Retransmit Thread: All threads running continuously
 
     Student->>React Client: Enters question
-    React Client->>Django API: POST /questions
+    React Client->>Django API: POST /helprequest
     Django API->>Postgres: Store question
     Django API->>Valkey: Publish question
 
