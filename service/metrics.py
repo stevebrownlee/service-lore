@@ -1,4 +1,3 @@
-# metrics.py
 from prometheus_client import Counter, Histogram, Gauge
 
 class Metrics:

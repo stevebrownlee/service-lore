@@ -24,12 +24,26 @@ class LoreService:
         # Load configuration
         self.settings = Settings()
 
+        structlog.configure(
+            processors=[
+                structlog.contextvars.merge_contextvars,
+                structlog.processors.add_log_level,
+                structlog.processors.TimeStamper(fmt="iso"),
+                structlog.processors.format_exc_info,
+                structlog.processors.JSONRenderer()
+            ],
+            wrapper_class=structlog.make_filtering_bound_logger(self.settings.LOG_LEVEL),
+            context_class=dict,
+            logger_factory=structlog.PrintLoggerFactory(),
+            cache_logger_on_first_use=True
+        )
+
         # Initialize structured logging
         self.log = structlog.get_logger()
-        self.log.info("initializing_service", log_level=self.settings.LOG_LEVEL)
 
         # Initialize metrics
         self.metrics = Metrics()
+
 
         # Set up buffer for managing unacknowledged text chunks
         self.active_buffers: dict[int, ChunkBuffer] = {}
@@ -176,7 +190,7 @@ class LoreService:
                         "streamer": streamer,
                         "max_new_tokens": self.settings.MODEL_MAX_LENGTH,
                         "do_sample": True,
-                        "temperature": 0.7,
+                        "temperature": self.settings.MODEL_TEMPERATURE,
                         "top_p": 0.9,
                         "top_k": 50,
                         "repetition_penalty": 1.2,
@@ -401,8 +415,14 @@ class LoreService:
         """Start the service"""
         try:
             # Start Prometheus metrics server
-            start_http_server(self.settings.PROMETHEUS_PORT)
-            self.log.info("metrics_server_started", port=self.settings.PROMETHEUS_PORT)
+            start_http_server(
+                port=self.settings.METRICS_PORT,
+                addr=self.settings.METRICS_HOST
+            )
+            self.log.info("metrics_endpoint_started",
+                host=self.settings.METRICS_HOST,
+                port=self.settings.METRICS_PORT
+            )
 
             # Set running flag and start threads
             self.running.set()

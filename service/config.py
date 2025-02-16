@@ -1,6 +1,6 @@
 """ Configuration settings for the Lore service """
 import os
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 class Settings(BaseModel):
     """ Configuration settings for the Lore service """
@@ -37,9 +37,13 @@ class Settings(BaseModel):
     )
 
     # Metrics configuration
-    PROMETHEUS_PORT: int = Field(
-        default=int(os.getenv("PROMETHEUS_PORT", "8901")),
-        description="Port for Prometheus metrics server"
+    METRICS_HOST: str = Field(
+        default=os.getenv("METRICS_HOST", "0.0.0.0"),
+        description="Host for Prometheus metrics HTTP endpoint"
+    )
+    METRICS_PORT: int = Field(
+        default=int(os.getenv("METRICS_PORT", "8901")),
+        description="Port for Prometheus metrics HTTP endpoint"
     )
 
     # Channel names
@@ -110,6 +114,31 @@ class Settings(BaseModel):
         4. Connect to familiar concepts""",
         description="System prompt for the model"
     )
+
+    # Grafana settings
+    GRAFANA_URL: str = Field(
+        default="http://localhost:3000",
+        description="Grafana server URL"
+    )
+    GRAFANA_USER: str = Field(
+        default="admin",
+        description="Grafana admin username"
+    )
+    GRAFANA_PASSWORD: str = Field(
+        default="admin",
+        description="Grafana admin password"
+    )
+    PROMETHEUS_URL: str = Field(
+        default=None,
+        description="Prometheus server URL"
+    )
+
+    @field_validator('PROMETHEUS_URL', mode='before')
+    def set_prometheus_url(cls, v, values):
+        """Set Prometheus URL based on port if not explicitly provided"""
+        if v is None and 'PROMETHEUS_PORT' in values:
+            return f"http://localhost:{values['PROMETHEUS_PORT']}"
+        return v or "http://localhost:9090"
 
     class Config:
         """Pydantic model configuration"""
